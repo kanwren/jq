@@ -177,8 +177,8 @@ jv stack_pop(jq_state *jq) {
   return val;
 }
 
-// Like stack_pop(), but assert !stack_pop_will_free() and replace with
-// jv_null() on the stack.
+// Like stack_pop(), but replace the saved stack cell with jv_null() when the
+// cell cannot be physically freed yet.
 jv stack_popn(jq_state *jq) {
   jv* sval = stack_block(&jq->stk, jq->stk_top);
   jv val = *sval;
@@ -206,6 +206,39 @@ struct stack_pos {
 struct stack_pos stack_get_pos(jq_state* jq) {
   struct stack_pos sp = {jq->stk_top, jq->curr_frame};
   return sp;
+}
+
+static int stack_contains(struct stack* stk, stack_ptr haystack, stack_ptr needle) {
+  for (stack_ptr p = haystack; p; p = *stack_block_next(stk, p)) {
+    if (p == needle)
+      return 1;
+    // Stack links move toward older, higher-address blocks.
+    if (p > needle)
+      return 0;
+  }
+  return 0;
+}
+
+static int stack_top_reachable_from_forkpoints(jq_state* jq, int skip_top_forkpoint) {
+  stack_ptr target = jq->stk_top;
+
+  stack_ptr fork_pos = jq->fork_top;
+  if (skip_top_forkpoint && fork_pos)
+    fork_pos = *stack_block_next(&jq->stk, fork_pos);
+
+  for (; fork_pos; fork_pos = *stack_block_next(&jq->stk, fork_pos)) {
+    struct forkpoint* fork = stack_block(&jq->stk, fork_pos);
+    if (stack_contains(&jq->stk, fork->saved_data_stack, target))
+      return 1;
+  }
+  return 0;
+}
+
+static jv stack_popn_if_unshared(jq_state *jq, int skip_top_forkpoint) {
+  if (stack_pop_will_free(&jq->stk, jq->stk_top) ||
+      !stack_top_reachable_from_forkpoints(jq, skip_top_forkpoint))
+    return stack_popn(jq);
+  return stack_pop(jq);
 }
 
 void stack_save(jq_state *jq, uint16_t* retaddr, struct stack_pos sp){
@@ -429,7 +462,11 @@ jv jq_next(jq_state *jq) {
     }
 
     case DUPN: {
-      jv v = stack_popn(jq);
+      // The most recent fork point is the reduce finalizer. It can restore
+      // the input stack cell, but only to discard it while returning the
+      // accumulator. Older fork points are real continuations and must keep
+      // seeing the value.
+      jv v = stack_popn_if_unshared(jq, 1);
       stack_push(jq, jv_copy(v));
       stack_push(jq, v);
       break;
@@ -567,7 +604,7 @@ jv jq_next(jq_state *jq) {
         jv_dump(jv_copy(*var), JV_PRINT_REFCOUNT);
         printf("\n");
       }
-      jv_free(stack_popn(jq));
+      jv_free(stack_popn_if_unshared(jq, 0));
 
       // This `stack_push()` invalidates the `var` reference, so
       stack_push(jq, *var);

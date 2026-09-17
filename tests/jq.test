@@ -925,6 +925,17 @@ reduce . as $n (.; .)
 null
 null
 
+# regression test for reduce's conditional input cleanup
+[1] | reduce .[] as $x (., .; .)
+null
+[1]
+[1]
+
+[1] | (., .) | reduce .[] as $x (0; . + $x)
+null
+1
+1
+
 # Destructuring
 . as {$a, b: [$c, {$d}]} | [$a, $c, $d]
 {"a":1, "b":[2,{"d":3}]}
