@@ -208,35 +208,16 @@ struct stack_pos stack_get_pos(jq_state* jq) {
   return sp;
 }
 
-static int stack_contains(struct stack* stk, stack_ptr haystack, stack_ptr needle) {
-  for (stack_ptr p = haystack; p; p = *stack_block_next(stk, p)) {
-    if (p == needle)
-      return 1;
-    // Stack links move toward older, higher-address blocks.
-    if (p > needle)
-      return 0;
-  }
-  return 0;
-}
-
-static int stack_top_reachable_from_forkpoints(jq_state* jq, int skip_top_forkpoint) {
-  stack_ptr target = jq->stk_top;
-
+static int has_visible_forkpoint(jq_state* jq, int skip_top_forkpoint) {
   stack_ptr fork_pos = jq->fork_top;
   if (skip_top_forkpoint && fork_pos)
     fork_pos = *stack_block_next(&jq->stk, fork_pos);
-
-  for (; fork_pos; fork_pos = *stack_block_next(&jq->stk, fork_pos)) {
-    struct forkpoint* fork = stack_block(&jq->stk, fork_pos);
-    if (stack_contains(&jq->stk, fork->saved_data_stack, target))
-      return 1;
-  }
-  return 0;
+  return fork_pos != 0;
 }
 
 static jv stack_popn_if_unshared(jq_state *jq, int skip_top_forkpoint) {
   if (stack_pop_will_free(&jq->stk, jq->stk_top) ||
-      !stack_top_reachable_from_forkpoints(jq, skip_top_forkpoint))
+      !has_visible_forkpoint(jq, skip_top_forkpoint))
     return stack_popn(jq);
   return stack_pop(jq);
 }
