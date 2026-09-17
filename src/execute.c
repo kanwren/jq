@@ -16,6 +16,14 @@
 #include "builtin.h"
 #include "linker.h"
 
+#ifndef JQ_USE_COMPUTED_GOTO
+# if defined(__GNUC__) && !defined(__STRICT_ANSI__)
+#  define JQ_USE_COMPUTED_GOTO 1
+# else
+#  define JQ_USE_COMPUTED_GOTO 0
+# endif
+#endif
+
 struct jq_state {
   void (*nomem_handler)(void *);
   void *nomem_handler_data;
@@ -337,24 +345,139 @@ static void set_error(jq_state *jq, jv value) {
 
 #define ON_BACKTRACK(op) ((op)+NUM_OPCODES)
 
+#if !JQ_USE_COMPUTED_GOTO
+#define JQ_NEXT break
+#define JQ_LABEL(label)
+#else
+#define JQ_LABEL(label) label:
+#endif
+
 jv jq_next(jq_state *jq) {
   jv_nomem_handler(jq->nomem_handler, jq->nomem_handler_data);
+
+#if JQ_USE_COMPUTED_GOTO
+  static void* dispatch_table[NUM_OPCODES * 2] = {
+    [TOP] = &&do_TOP,
+    [ERRORK] = &&do_ERRORK,
+    [LOADK] = &&do_LOADK,
+    [GENLABEL] = &&do_GENLABEL,
+    [DUP] = &&do_DUP,
+    [DUP2] = &&do_DUP2,
+    [SUBEXP_BEGIN] = &&do_SUBEXP_BEGIN,
+    [SUBEXP_END] = &&do_SUBEXP_END,
+    [PUSHK_UNDER] = &&do_PUSHK_UNDER,
+    [POP] = &&do_POP,
+    [APPEND] = &&do_APPEND,
+    [INSERT] = &&do_INSERT,
+    [RANGE] = &&do_RANGE,
+    [LOADV] = &&do_LOADV,
+    [LOADVN] = &&do_LOADVN,
+    [STOREVN] = &&do_STOREVN,
+    [STOREV] = &&do_STOREV,
+    [STORE_GLOBAL] = &&do_STORE_GLOBAL,
+    [PATH_BEGIN] = &&do_PATH_BEGIN,
+    [PATH_END] = &&do_PATH_END,
+    [INDEX] = &&do_INDEX,
+    [INDEX_OPT] = &&do_INDEX_OPT,
+    [JUMP] = &&do_JUMP,
+    [JUMP_F] = &&do_JUMP_F,
+    [EACH] = &&do_EACH,
+    [EACH_OPT] = &&do_EACH_OPT,
+    [BACKTRACK] = &&do_BACKTRACK,
+    [TRY_BEGIN] = &&do_TRY_BEGIN,
+    [TRY_END] = &&do_TRY_END,
+    [DESTRUCTURE_ALT] = &&do_DESTRUCTURE_ALT,
+    [FORK] = &&do_FORK,
+    [CALL_BUILTIN] = &&do_CALL_BUILTIN,
+    [TAIL_CALL_JQ] = &&do_TAIL_CALL_JQ,
+    [CALL_JQ] = &&do_CALL_JQ,
+    [RET] = &&do_RET,
+
+    [ON_BACKTRACK(RANGE)] = &&do_backtrack_RANGE,
+    [ON_BACKTRACK(STOREVN)] = &&do_backtrack_STOREVN,
+    [ON_BACKTRACK(PATH_BEGIN)] = &&do_backtrack_PATH_BEGIN,
+    [ON_BACKTRACK(PATH_END)] = &&do_backtrack_PATH_END,
+    [ON_BACKTRACK(EACH)] = &&do_backtrack_EACH,
+    [ON_BACKTRACK(EACH_OPT)] = &&do_backtrack_EACH_OPT,
+    [ON_BACKTRACK(TRY_BEGIN)] = &&do_backtrack_TRY_BEGIN,
+    [ON_BACKTRACK(TRY_END)] = &&do_backtrack_TRY_END,
+    [ON_BACKTRACK(DESTRUCTURE_ALT)] = &&do_backtrack_DESTRUCTURE_ALT,
+    [ON_BACKTRACK(FORK)] = &&do_backtrack_FORK,
+    [ON_BACKTRACK(RET)] = &&do_backtrack_RET,
+  };
+#define JQ_NEXT do {                                                       \
+    if (jq->halted) {                                                      \
+      if (jq->debug_trace_enabled)                                         \
+        printf("\t<halted>\n");                                            \
+      return jv_invalid();                                                 \
+    }                                                                      \
+    opcode = *pc;                                                          \
+    raising = 0;                                                           \
+                                                                           \
+    if (jq->debug_trace_enabled) {                                         \
+      dump_operation(frame_current(jq)->bc, pc);                           \
+      printf("\t");                                                        \
+      const struct opcode_description* opdesc = opcode_describe(opcode);   \
+      stack_ptr param = 0;                                                 \
+      if (!backtracking) {                                                 \
+        int stack_in = opdesc->stack_in;                                   \
+        if (stack_in == -1) stack_in = pc[1];                              \
+        param = jq->stk_top;                                               \
+        for (int i=0; i<stack_in; i++) {                                   \
+          if (i != 0) {                                                    \
+            printf(" | ");                                                 \
+            param = *stack_block_next(&jq->stk, param);                    \
+          }                                                                \
+          if (!param) break;                                               \
+          jv_dump(jv_copy(*(jv*)stack_block(&jq->stk, param)),             \
+                  JV_PRINT_REFCOUNT);                                      \
+        }                                                                  \
+        if (jq->debug_trace_enabled & JQ_DEBUG_TRACE_DETAIL) {             \
+          while ((param = *stack_block_next(&jq->stk, param))) {           \
+            printf(" || ");                                                \
+            jv_dump(jv_copy(*(jv*)stack_block(&jq->stk, param)),           \
+                    JV_PRINT_REFCOUNT);                                    \
+          }                                                                \
+        }                                                                  \
+      } else {                                                             \
+        printf("\t<backtracking>");                                        \
+      }                                                                    \
+                                                                           \
+      printf("\n");                                                        \
+    }                                                                      \
+                                                                           \
+    if (backtracking) {                                                    \
+      opcode = ON_BACKTRACK(opcode);                                       \
+      backtracking = 0;                                                    \
+      raising = !jv_is_valid(jq->error);                                   \
+    }                                                                      \
+    pc++;                                                                  \
+                                                                           \
+    if (opcode < NUM_OPCODES * 2 && dispatch_table[opcode])                \
+      goto *dispatch_table[opcode];                                        \
+    goto do_invalid;                                                       \
+  } while (0)
+#endif
 
   uint16_t* pc = stack_restore(jq);
   assert(pc);
 
   int raising;
+  uint16_t opcode;
   int backtracking = !jq->initial_execution;
 
   jq->initial_execution = 0;
   assert(jv_get_kind(jq->error) == JV_KIND_NULL);
   while (1) {
+#if JQ_USE_COMPUTED_GOTO
+    JQ_NEXT;
+#else
     if (jq->halted) {
       if (jq->debug_trace_enabled)
         printf("\t<halted>\n");
       return jv_invalid();
     }
-    uint16_t opcode = *pc;
+    opcode = *pc;
     raising = 0;
 
     if (jq->debug_trace_enabled) {
@@ -397,54 +520,67 @@ jv jq_next(jq_state *jq) {
     }
     pc++;
 
+#endif
+
     switch (opcode) {
-    default: assert(0 && "invalid instruction");
+    JQ_LABEL(do_invalid)
+    default:
+      assert(0 && "invalid instruction");
+      abort();
 
-    case TOP: break;
+    JQ_LABEL(do_TOP)
+    case TOP: JQ_NEXT;
 
+    JQ_LABEL(do_ERRORK)
     case ERRORK: {
       jv v = jv_array_get(jv_copy(frame_current(jq)->bc->constants), *pc++);
       set_error(jq, jv_invalid_with_msg(v));
       goto do_backtrack;
     }
 
+    JQ_LABEL(do_LOADK)
     case LOADK: {
       jv v = jv_array_get(jv_copy(frame_current(jq)->bc->constants), *pc++);
       assert(jv_is_valid(v));
       jv_free(stack_pop(jq));
       stack_push(jq, v);
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_GENLABEL)
     case GENLABEL: {
       stack_push(jq, JV_OBJECT(jv_string("__jq"), jv_number(jq->next_label++)));
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_DUP)
     case DUP: {
       jv v = stack_pop(jq);
       stack_push(jq, jv_copy(v));
       stack_push(jq, v);
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_DUP2)
     case DUP2: {
       jv keep = stack_pop(jq);
       jv v = stack_pop(jq);
       stack_push(jq, jv_copy(v));
       stack_push(jq, keep);
       stack_push(jq, v);
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_SUBEXP_BEGIN)
     case SUBEXP_BEGIN: {
       jv v = stack_pop(jq);
       stack_push(jq, jv_copy(v));
       stack_push(jq, v);
       jq->subexp_nest++;
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_SUBEXP_END)
     case SUBEXP_END: {
       assert(jq->subexp_nest > 0);
       jq->subexp_nest--;
@@ -452,23 +588,26 @@ jv jq_next(jq_state *jq) {
       jv b = stack_pop(jq);
       stack_push(jq, a);
       stack_push(jq, b);
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_PUSHK_UNDER)
     case PUSHK_UNDER: {
       jv v = jv_array_get(jv_copy(frame_current(jq)->bc->constants), *pc++);
       assert(jv_is_valid(v));
       jv v2 = stack_pop(jq);
       stack_push(jq, v);
       stack_push(jq, v2);
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_POP)
     case POP: {
       jv_free(stack_pop(jq));
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_APPEND)
     case APPEND: {
       jv v = stack_pop(jq);
       uint16_t level = *pc++;
@@ -476,9 +615,10 @@ jv jq_next(jq_state *jq) {
       jv* var = frame_local_var(jq, vidx, level);
       assert(jv_get_kind(*var) == JV_KIND_ARRAY);
       *var = jv_array_append(*var, v);
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_INSERT)
     case INSERT: {
       jv stktop = stack_pop(jq);
       jv v = stack_pop(jq);
@@ -500,10 +640,12 @@ jv jq_next(jq_state *jq) {
         jv_free(objv);
         goto do_backtrack;
       }
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_backtrack_RANGE)
     case ON_BACKTRACK(RANGE):
+    JQ_LABEL(do_RANGE)
     case RANGE: {
       uint16_t level = *pc++;
       uint16_t v = *pc++;
@@ -537,10 +679,11 @@ jv jq_next(jq_state *jq) {
 
         stack_push(jq, curr);
       }
-      break;
+      JQ_NEXT;
     }
 
       // FIXME: loadv/storev may do too much copying/freeing
+    JQ_LABEL(do_LOADV)
     case LOADV: {
       uint16_t level = *pc++;
       uint16_t v = *pc++;
@@ -552,10 +695,11 @@ jv jq_next(jq_state *jq) {
       }
       jv_free(stack_pop(jq));
       stack_push(jq, jv_copy(*var));
-      break;
+      JQ_NEXT;
     }
 
       // Does a load but replaces the variable with null
+    JQ_LABEL(do_LOADVN)
     case LOADVN: {
       uint16_t level = *pc++;
       uint16_t v = *pc++;
@@ -572,13 +716,15 @@ jv jq_next(jq_state *jq) {
       // we have to re-resolve `var` before we can set it to null
       var = frame_local_var(jq, v, level);
       *var = jv_null();
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_STOREVN)
     case STOREVN:
         stack_save(jq, pc - 1, stack_get_pos(jq));
         JQ_FALLTHROUGH;
-    case STOREV: {
+    case STOREV:
+    JQ_LABEL(do_STOREV) {
       uint16_t level = *pc++;
       uint16_t v = *pc++;
       jv* var = frame_local_var(jq, v, level);
@@ -590,9 +736,10 @@ jv jq_next(jq_state *jq) {
       }
       jv_free(*var);
       *var = val;
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_backtrack_STOREVN)
     case ON_BACKTRACK(STOREVN): {
       uint16_t level = *pc++;
       uint16_t v = *pc++;
@@ -600,9 +747,9 @@ jv jq_next(jq_state *jq) {
       jv_free(*var);
       *var = jv_null();
       goto do_backtrack;
-      break;
     }
 
+    JQ_LABEL(do_STORE_GLOBAL)
     case STORE_GLOBAL: {
       // Get the constant
       jv val = jv_array_get(jv_copy(frame_current(jq)->bc->constants), *pc++);
@@ -619,9 +766,10 @@ jv jq_next(jq_state *jq) {
       }
       jv_free(*var);
       *var = val;
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_PATH_BEGIN)
     case PATH_BEGIN: {
       jv v = stack_pop(jq);
       stack_push(jq, jq->path);
@@ -635,9 +783,10 @@ jv jq_next(jq_state *jq) {
       jq->path = jv_array();
       jq->value_at_path = v; // next INDEX operation must index into v
       jq->subexp_nest = 0;
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_PATH_END)
     case PATH_END: {
       jv v = stack_pop(jq);
       // detect invalid path expression like path(.a | reverse)
@@ -665,17 +814,21 @@ jv jq_next(jq_state *jq) {
       jq->subexp_nest = old_subexp_nest;
       jv_free(jq->value_at_path);
       jq->value_at_path = old_value_at_path;
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_backtrack_PATH_BEGIN)
     case ON_BACKTRACK(PATH_BEGIN):
+    JQ_LABEL(do_backtrack_PATH_END)
     case ON_BACKTRACK(PATH_END): {
       jv_free(jq->path);
       jq->path = stack_pop(jq);
       goto do_backtrack;
     }
 
+    JQ_LABEL(do_INDEX)
     case INDEX:
+    JQ_LABEL(do_INDEX_OPT)
     case INDEX_OPT: {
       jv t = stack_pop(jq);
       jv k = stack_pop(jq);
@@ -702,16 +855,18 @@ jv jq_next(jq_state *jq) {
           jv_free(v);
         goto do_backtrack;
       }
-      break;
+      JQ_NEXT;
     }
 
 
+    JQ_LABEL(do_JUMP)
     case JUMP: {
       uint16_t offset = *pc++;
       pc += offset;
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_JUMP_F)
     case JUMP_F: {
       uint16_t offset = *pc++;
       jv t = stack_pop(jq);
@@ -720,10 +875,12 @@ jv jq_next(jq_state *jq) {
         pc += offset;
       }
       stack_push(jq, t); // FIXME do this better
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_EACH)
     case EACH:
+    JQ_LABEL(do_EACH_OPT)
     case EACH_OPT: {
       jv container = stack_pop(jq);
       // detect invalid path expression like path(reverse | .[])
@@ -740,7 +897,9 @@ jv jq_next(jq_state *jq) {
       JQ_FALLTHROUGH;
     }
     case ON_BACKTRACK(EACH):
-    case ON_BACKTRACK(EACH_OPT): {
+    JQ_LABEL(do_backtrack_EACH)
+    case ON_BACKTRACK(EACH_OPT):
+    JQ_LABEL(do_backtrack_EACH_OPT) {
       int idx = jv_number_value(stack_pop(jq));
       jv container = stack_pop(jq);
 
@@ -796,10 +955,11 @@ jv jq_next(jq_state *jq) {
         path_append(jq, key, jv_copy(value));
         stack_push(jq, value);
       }
-      break;
+      JQ_NEXT;
     }
 
     do_backtrack:
+    JQ_LABEL(do_BACKTRACK)
     case BACKTRACK: {
       pc = stack_restore(jq);
       if (!pc) {
@@ -811,18 +971,21 @@ jv jq_next(jq_state *jq) {
         return jv_invalid();
       }
       backtracking = 1;
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_TRY_BEGIN)
     case TRY_BEGIN:
       stack_save(jq, pc - 1, stack_get_pos(jq));
       pc++; // skip handler offset this time
-      break;
+      JQ_NEXT;
 
+    JQ_LABEL(do_TRY_END)
     case TRY_END:
       stack_save(jq, pc - 1, stack_get_pos(jq));
-      break;
+      JQ_NEXT;
 
+    JQ_LABEL(do_backtrack_TRY_BEGIN)
     case ON_BACKTRACK(TRY_BEGIN): {
       if (!raising) {
         /*
@@ -859,21 +1022,25 @@ jv jq_next(jq_state *jq) {
       stack_push(jq, jv_invalid_get_msg(jq->error));  // push the error's message
       jq->error = jv_null();
       pc += offset;
-      break;
+      JQ_NEXT;
     }
+    JQ_LABEL(do_backtrack_TRY_END)
     case ON_BACKTRACK(TRY_END):
       // Wrap the error so the matching TRY_BEGIN doesn't catch it
       if (raising)
         set_error(jq, jv_invalid_with_msg(jv_copy(jq->error)));
       goto do_backtrack;
 
+    JQ_LABEL(do_DESTRUCTURE_ALT)
     case DESTRUCTURE_ALT:
+    JQ_LABEL(do_FORK)
     case FORK: {
       stack_save(jq, pc - 1, stack_get_pos(jq));
       pc++; // skip offset this time
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_backtrack_DESTRUCTURE_ALT)
     case ON_BACKTRACK(DESTRUCTURE_ALT): {
       if (jv_is_valid(jq->error)) {
         // `try EXP ...` backtracked here (no value, `empty`), so we backtrack more
@@ -892,15 +1059,17 @@ jv jq_next(jq_state *jq) {
       jq->error = jv_null();
       uint16_t offset = *pc++;
       pc += offset;
-      break;
+      JQ_NEXT;
     }
+    JQ_LABEL(do_backtrack_FORK)
     case ON_BACKTRACK(FORK): {
       if (raising) goto do_backtrack;
       uint16_t offset = *pc++;
       pc += offset;
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_CALL_BUILTIN)
     case CALL_BUILTIN: {
       int nargs = *pc++;
       struct cfunction* function = &frame_current(jq)->bc->globals->cfunctions[*pc++];
@@ -926,10 +1095,12 @@ jv jq_next(jq_state *jq) {
       }
 
       stack_push(jq, top);
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_TAIL_CALL_JQ)
     case TAIL_CALL_JQ:
+    JQ_LABEL(do_CALL_JQ)
     case CALL_JQ: {
       /*
        * Bytecode layout here:
@@ -971,9 +1142,10 @@ jv jq_next(jq_state *jq) {
       new_frame->retaddr = retaddr;
       pc = new_frame->bc->code;
       stack_push(jq, input);
-      break;
+      JQ_NEXT;
     }
 
+    JQ_LABEL(do_RET)
     case RET: {
       jv value = stack_pop(jq);
       assert(jq->stk_top == frame_current(jq)->retdata);
@@ -990,8 +1162,9 @@ jv jq_next(jq_state *jq) {
         return value;
       }
       stack_push(jq, value);
-      break;
+      JQ_NEXT;
     }
+    JQ_LABEL(do_backtrack_RET)
     case ON_BACKTRACK(RET): {
       // resumed after top-level return
       goto do_backtrack;
