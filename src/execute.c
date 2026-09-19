@@ -177,6 +177,14 @@ jv stack_pop(jq_state *jq) {
   return val;
 }
 
+void stack_pop_free(jq_state *jq) {
+  if (stack_pop_will_free(&jq->stk, jq->stk_top)) {
+    jv* sval = stack_block(&jq->stk, jq->stk_top);
+    jv_free(*sval);
+  }
+  jq->stk_top = stack_pop_block(&jq->stk, jq->stk_top, sizeof(jv));
+}
+
 // Like stack_pop(), but assert !stack_pop_will_free() and replace with
 // jv_null() on the stack.
 jv stack_popn(jq_state *jq) {
@@ -270,7 +278,7 @@ _jq_path_append(jq_state *jq, jv v, jv p, jv value_at_path) {
 uint16_t* stack_restore(jq_state *jq){
   while (!stack_pop_will_free(&jq->stk, jq->fork_top)) {
     if (stack_pop_will_free(&jq->stk, jq->stk_top)) {
-      jv_free(stack_pop(jq));
+      stack_pop_free(jq);
     } else if (stack_pop_will_free(&jq->stk, jq->curr_frame)) {
       frame_pop(jq);
     } else {
@@ -411,7 +419,7 @@ jv jq_next(jq_state *jq) {
     case LOADK: {
       jv v = jv_array_get(jv_copy(frame_current(jq)->bc->constants), *pc++);
       assert(jv_is_valid(v));
-      jv_free(stack_pop(jq));
+      stack_pop_free(jq);
       stack_push(jq, v);
       break;
     }
@@ -465,7 +473,7 @@ jv jq_next(jq_state *jq) {
     }
 
     case POP: {
-      jv_free(stack_pop(jq));
+      stack_pop_free(jq);
       break;
     }
 
@@ -550,7 +558,7 @@ jv jq_next(jq_state *jq) {
         jv_dump(jv_copy(*var), JV_PRINT_REFCOUNT);
         printf("\n");
       }
-      jv_free(stack_pop(jq));
+      stack_pop_free(jq);
       stack_push(jq, jv_copy(*var));
       break;
     }
@@ -829,7 +837,7 @@ jv jq_next(jq_state *jq) {
          * `try EXP ...` -- EXP backtracked (e.g., EXP was `empty`), so we
          * backtrack more:
          */
-        jv_free(stack_pop(jq));
+        stack_pop_free(jq);
         goto do_backtrack;
       }
 
@@ -855,7 +863,7 @@ jv jq_next(jq_state *jq) {
        * See commentary in gen_try().
        */
       uint16_t offset = *pc++;
-      jv_free(stack_pop(jq)); // free the input
+      stack_pop_free(jq); // free the input
       stack_push(jq, jv_invalid_get_msg(jq->error));  // push the error's message
       jq->error = jv_null();
       pc += offset;
@@ -877,14 +885,14 @@ jv jq_next(jq_state *jq) {
     case ON_BACKTRACK(DESTRUCTURE_ALT): {
       if (jv_is_valid(jq->error)) {
         // `try EXP ...` backtracked here (no value, `empty`), so we backtrack more
-        jv_free(stack_pop(jq));
+        stack_pop_free(jq);
         goto do_backtrack;
       }
       // `try EXP ...` exception caught in EXP
       // DESTRUCTURE_ALT doesn't want the error message on the stack,
       // as we would just want to throw it away anyway.
       if (opcode != ON_BACKTRACK(DESTRUCTURE_ALT)) {
-        jv_free(stack_pop(jq)); // free the input
+        stack_pop_free(jq); // free the input
         stack_push(jq, jv_invalid_get_msg(jq->error));  // push the error's message
       } else {
         jv_free(jq->error);
